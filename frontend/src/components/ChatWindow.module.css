@@ -1,0 +1,13 @@
+.window {
+  flex: 1;
+  overflow-y: auto;
+  background: var(--bg);
+}
+
+.inner {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 24px 20px;
+  min-height: 100%;
+}

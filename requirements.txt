@@ -1,10 +1,21 @@
-streamlit
+# API & server
+flask
+flask-cors
+
+# RAG pipeline
+faiss-cpu
+sentence-transformers
+rank-bm25
+google-genai
+
+# Data processing
 pandas
 numpy
-faiss-cpu 
-requests
-sentence-transformers
 python-dotenv
-langchain
-llama-cpp-python
-google-generativeai
+
+# Scraper
+selenium
+webdriver-manager
+beautifulsoup4
+lxml
+requests
