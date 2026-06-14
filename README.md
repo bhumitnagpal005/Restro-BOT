@@ -1,244 +1,184 @@
 # RestroBot
 
-A powerful, AI-driven assistant specialized in restaurant information and menu queries. Leveraging advanced natural language processing capabilities, it provides users with accurate and concise responses about various restaurants, their menus, pricing, and locations.
+A full-stack AI assistant for querying restaurant menus in Roorkee, India. Built on an advanced RAG pipeline with hybrid retrieval, cross-encoder reranking, and LLM-as-judge evaluation — served via a Flask REST API and a React + Vite chat frontend.
 
-## Directory Structure
+---
+
+## Architecture
 
 ```
-Zomato-Gen-AI/
-├── menu/
-│   ├── baap_of_rolls_menu.json
-│   ├── desi_tadka_menu.json
-│   ├── dominos_menu.json
-│   ├── foodbay_menu.json
-│   ├── kfc_menu.json
-│   ├── patiala_lassi_menu.json
-│   ├── pizza_hut_menu.json
-│   ├── prakash_hotel_menu.json
-│   └── waffle_by_nature_menu.json
-├── README.md
-├── app.py
-├── data_cleaning.py
-├── data_scraper.py
-├── database.csv
-├── rag.py
+User Query (React UI)
+        │
+        ▼
+Flask REST API  (/api/chat)
+        │
+        ▼
+  RAG Pipeline
+  ┌─────────────────────────────────────┐
+  │  Stage 1 — Hybrid Retrieval         │
+  │  ┌─────────────┐  ┌──────────────┐  │
+  │  │ FAISS Dense │  │  BM25 Sparse │  │
+  │  │ (all-MiniLM)│  │  (keyword)   │  │
+  │  └──────┬──────┘  └──────┬───────┘  │
+  │         └────────┬────────┘          │
+  │    Reciprocal Rank Fusion (top-20)   │
+  │                  │                   │
+  │  Stage 2 — Cross-Encoder Reranking   │
+  │       ms-marco-MiniLM-L-6-v2         │
+  │            top-20 → top-5            │
+  └──────────────────┬───────────────────┘
+                     │
+              Conversation Memory
+              (5-turn sliding window)
+                     │
+                     ▼
+           Gemini 2.5 Flash (generation)
+                     │
+                     ▼
+              Response + Metrics
+```
+
+---
+
+## Project Structure
+
+```
+RestroBot/
+├── backend/
+│   ├── app.py                  # Flask REST API
+│   ├── rag/
+│   │   ├── pipeline.py         # Orchestrator + session management
+│   │   ├── retrieval.py        # HybridRetriever (FAISS + BM25 + reranker)
+│   │   ├── memory.py           # ConversationMemory (sliding window)
+│   │   ├── generation.py       # Gemini 2.5 Flash response generation
+│   │   └── metrics.py          # LLM-as-judge evaluation
+│   ├── data/
+│   │   ├── scraper.py          # Zomato scraper (Selenium + BeautifulSoup)
+│   │   ├── cleaner.py          # JSON → cleaned document strings
+│   │   └── runner.py           # Scrape all 9 restaurants
+│   ├── menu/                   # Scraped JSON files (9 restaurants)
+│   └── index_cache/            # Persisted FAISS index + BM25 (auto-generated)
+├── frontend/
+│   ├── src/
+│   │   ├── App.jsx
+│   │   └── components/
+│   │       ├── Header.jsx
+│   │       ├── ChatWindow.jsx
+│   │       ├── Message.jsx
+│   │       ├── InputBar.jsx
+│   │       ├── TypingIndicator.jsx
+│   │       └── MetricsPanel.jsx
+│   ├── package.json
+│   └── vite.config.js          # Proxies /api → localhost:5001
 ├── requirements.txt
-└── scraper_runner.py
-
+└── .env.example
 ```
+
+---
+
+## RAG Pipeline
+
+### Stage 1 — Hybrid Retrieval
+Two complementary retrieval methods are run in parallel and fused:
+
+- **Dense (FAISS):** Documents and queries are embedded using `all-MiniLM-L6-v2`. FAISS performs fast nearest-neighbour search over 500+ menu document vectors, capturing semantic similarity (e.g. "cheap sandwich" matches "affordable burger").
+- **Sparse (BM25):** Classic keyword scoring that excels at exact matches — restaurant names, dish names, prices.
+- **Reciprocal Rank Fusion (RRF):** Merges both ranked lists without weight tuning. Documents appearing high in both lists score highest, producing a top-20 candidate pool.
+
+### Stage 2 — Cross-Encoder Reranking
+The cross-encoder (`ms-marco-MiniLM-L-6-v2`) reads each (query, candidate) pair jointly and scores direct relevance — more accurate than the bi-encoder used in Stage 1. Top-20 candidates are narrowed to top-5.
+
+### Generation
+The top-5 passages and the last 5 turns of conversation history are injected into a structured prompt for **Gemini 2.5 Flash**, which generates the final answer.
+
+### Evaluation (on-demand)
+Each response can be evaluated via `/api/evaluate` using **LLM-as-judge** — Gemini scores the response on:
+- **Faithfulness** — is every claim grounded in the retrieved context?
+- **Answer Relevance** — does the response directly address the query?
+
+This is intentionally on-demand (not automatic) to stay within free-tier API quotas.
+
+---
+
 ## Setup
-Config (.env)
+
+### 1. Environment variables
 ```sh
-hf_token = "YOUR-API-KEY"
-gemini_token = "PUBLIC-API-KEY"
+cp .env.example .env
+# Fill in your Gemini API key
 ```
 
-Environment
+### 2. Backend
 ```sh
-conda create -n myenv python=3.10
-conda activate myenv
-pip install -r requirements.txt
+cd backend
+python -m venv virenv
+source virenv/bin/activate      # Windows: virenv\Scripts\activate
+pip install -r ../requirements.txt
+python app.py
 ```
 
-## Table of Contents
-1. [System Architecture](#system-architecture)
-2. [Implementation Details & Design Decisions](#implementation-details--design-decisions)
-3. [Challenges Faced & Solutions](#challenges-faced--solutions)
-4. [Future Improvement Opportunities](#future-improvement-opportunities)
+On first run, the server builds and caches the FAISS + BM25 index. Subsequent starts load from `index_cache/` in seconds.
 
----
-## System Architecture
-
-```
-             +----------------+             +--------------------+             
-             | scraper_runner | --------->  |    scraper.py      |             
-             +----------------+             +--------------------+             
-                                                    |                          
-                                                    v                          
-                                        +------------------------+             
-                                        |   JSON menu files in   |             
-                                        |      /menu folder      |             
-                                        +------------------------+             
-                                                    |                          
-                                                    v                          
-                                        +------------------------+             
-                                        |  data_cleaning.py      |             
-                                        | - Cleaning & formatting|             
-                                        | - Gemini restaurant info|            
-                                        +------------------------+             
-                                                    |                          
-                                                    v                          
-                                        +------------------------+             
-                                        |   rag.py               |             
-                                        | - Embeddings via SBERT |             
-                                        | - FAISS Vector Store   |             
-                                        | - Gemini/LLaMA model   |             
-                                        +------------------------+             
-                                                    |                          
-                                                    v                          
-                                        +------------------------+             
-                                        |  Streamlit App (Local) |             
-                                        | - Hosted in browser    |             
-                                        | - User inputs/query UI |             
-                                        +------------------------+             
+### 3. Frontend
+```sh
+cd frontend
+npm install
+npm run dev
 ```
 
----
-
-## Implementation Details & Design Decisions
-
-### Module: `scraper_runner.py`
-- Acts as the **driver script** to initiate scraping across multiple Zomato URLs.
-- Maps restaurant names to their respective URLs and invokes `scrape_zomato()` from `scraper.py`.
-
-### Module: `scraper.py`
-Scrapes restaurant information and menu data from a Zomato restaurant page and saves it in structured JSON format.
-- Uses **Selenium WebDriver** (headless Chrome) to render and interact with the dynamic content of Zomato pages.
-- Clicks all "Read more" buttons to expand hidden descriptions.
-- Parses restaurant name, location, contact, menu categories, and items using **BeautifulSoup**.
-- Each menu item includes:
-  - Name, Price, Description
-  - Vegetarian/Non-Vegetarian type
-  - Estimated spice level (based on keywords in description)
-- Automatically saves the scraped data to a JSON file in the `/menu` folder.
-
-### Module: `data_cleaning.py`
-
-**Purpose:**  
-This module processes raw restaurant menu data extracted from Zomato (stored in JSON format), cleans and enriches it using preprocessing techniques and the Gemini LLM, and prepares it for embedding and retrieval in the chatbot.
-
-**Key Functionalities:**
-
-- **Text Cleaning (`clean_text`)**  
-  Normalizes and standardizes string content: converts to lowercase, removes symbols, trims whitespace.
-
-- **Price Normalization (`normalize_price`)**  
-  Extracts numeric values from price fields, removing symbols and unwanted characters.
-
-- **Synonym Handling (`apply_synonyms`)**  
-  Replaces domain-specific terms like “non-veg”, “combo”, or “spicy” with standardized phrases to ensure semantic consistency.
-
-- **Menu Data Enrichment (`load_and_clean_menus_from_json`)**
-  - Loads JSON files from the `/menu` directory.
-  - Extracts restaurant-level metadata: name, location, and contact info.
-  - Sends a structured prompt to **Gemini** to generate:
-    - Restaurant summary
-    - Types of cuisine served
-    - Operational hours
-  - Combines this info with detailed item data (category, item name, description, price, veg/non-veg, spice level).
-  - Outputs a flat list of all text chunks and saves them to `database.csv`.
-
-**Returns:**  
-A list of cleaned and enriched text strings describing restaurants and their menu items, suitable for use in retrieval-based systems.
-
-### Module: `rag.py`
-
-**Purpose:**  
-Serves as the core logic for the restaurant chatbot. It handles embedding generation, similarity-based document retrieval, and response generation using an LLM (either Gemini or LLaMA).
-
- **Key Components:**
-
-- **Data Loading (`load_data_from_json`)**  
-  Calls the `load_and_clean_menus_from_json()` from `data_cleaning.py` to obtain processed restaurant/menu text data.
-
-- **Embedding + Indexing (`build_faiss`)**  
-  - Generates sentence embeddings using SentenceTransformers (`all-MiniLM-L6-v2`).
-  - Constructs a **FAISS** index for fast vector similarity search.
-
-- **Query Retrieval (`retrieve`)**  
-  - Encodes the user query and searches the FAISS index.
-  - Returns the top-k most relevant documents as context.
-
-- **Response Generation (`query_llama`)**  
-  - Builds a structured prompt using the current query, retrieved context, and previous chat history.
-  - Calls Gemini (or optionally LLaMA) to generate a concise and contextually-aware answer.
-  - Maintains conversation history for reference in follow-up queries.
-
-- **Chatbot Handler (`chatbot`)**  
-  Orchestrates the above steps to serve end-to-end interaction: load → embed → retrieve → respond.
-
-**LLM Notes:**  
-- By default, uses **Gemini-1.5-Pro** via the `google.generativeai` API.
-- A commented-out section supports local **LLaMA models** via `llama_cpp`.
-
-**Returns:**  
-A conversational response and updated query history.
+Open [http://localhost:5173](http://localhost:5173) (or whichever port Vite assigns).
 
 ---
 
+## API
 
-## Web Interface via Streamlit
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `GET` | `/api/health` | Health check |
+| `POST` | `/api/chat` | Send a query, get a response + metrics |
+| `POST` | `/api/evaluate` | Run LLM-as-judge on a specific response |
+| `DELETE` | `/api/session/<id>` | Clear conversation history for a session |
 
-A user-friendly web interface was developed using **Streamlit** to make the chatbot accessible and interactive.
+### `POST /api/chat`
+```json
+// Request
+{ "query": "What's the cheapest veg burger at KFC?", "session_id": "<uuid>" }
 
-### app.py Highlights
-- Uses `streamlit` for a clean UI.
-- Initializes the model and FAISS index on app load using `@st.cache_resource`.
-- Accepts user input via a text box.
-- Retrieves relevant document chunks using FAISS and passes them to the `query_llama` function.
-- Maintains a running history of past queries and responses.
-- Displays the bot's most recent answer and the full conversation history.
+// Response
+{
+  "response": "The cheapest veg option at KFC is the Veg Rice Box at ₹149.",
+  "exchange_id": "<uuid>",
+  "metrics": {
+    "retrieval_confidence": 0.91,
+    "latency": { "retrieval_ms": 210, "generation_ms": 1840, "total_ms": 2050 }
+  }
+}
+```
 
-### Features:
-- Lightweight and fast loading with caching.
-- Context-aware follow-up question handling.
-- Integrated Gemini or LLaMA response engine for conversational output.
+### `POST /api/evaluate`
+```json
+// Request
+{ "exchange_id": "<uuid>" }
 
----
-## Challenges Faced & Solutions
-
-| **Challenge** | **Solution** |
-|---------------|--------------|
-| **Dynamic elements and lazy loading on Zomato pages** | Automated "Read more" button clicks using Selenium with retry loops. |
-| **Text inconsistencies across restaurants (e.g., 'non-veg' vs 'non vegetarian')** | Implemented regex-based synonym replacement to standardize terminology across all entries. |
-| **JSON structure variability across scraped outputs** | Standardized the output schema to separate restaurant metadata and menu items clearly. |
-| **Low accuracy with keyword-only retrieval** | Adopted **semantic retrieval** using SentenceTransformers + FAISS to improve relevance of retrieved content. |
-| **Context length limits in LLM prompts** | Introduced top-k retrieval using FAISS to keep prompts short and focused. |
-| **Poor handling of vague or follow-up queries** | Maintained conversation history and embedded it into prompts for better reference resolution. |
-| **Redundant embedding computation** | Used caching and minimized recomputation by generating all embeddings in advance. |
-| **Inconsistent LLaMA model responses** | Switched to **Gemini** for more reliable and accurate natural language responses. |
-| **Missing restaurant details (like cuisines or timings) in scraped data** | Used **Gemini** to generate enriched metadata through structured prompting. |
-
-
----
-
-## Future Improvement Opportunities
-
-1. **Persistent Chat History**  
-   Implement a backend database (e.g., SQLite or Firebase) to store user sessions, allowing for persistent chat context across sessions and devices.
-
-2. **User Authentication System**  
-   Add login functionality using `streamlit-authenticator` or OAuth for personalized chat sessions and access control.
-
-3. **UI/UX Enhancements**  
-   Improve the Streamlit interface with:
-   - Accordion-style collapsible restaurant sections
-   - Rich card views for menu items
-   - Sidebar filters (e.g., by cuisine, veg/non-veg, price)
-
-4. **Live Updates from Zomato**  
-   Automate periodic re-scraping of restaurant data to ensure the information remains up-to-date.
-
-5. **Parallel Scraping Engine**  
-   Improve scraping performance with `asyncio`, `aiohttp`, or multi-threading to handle multiple restaurant pages simultaneously.
-
-6. **Multilingual Support**  
-   Use translation APIs or models to support queries in multiple languages for a wider audience.
-
-7. **Query Auto-Suggestions**  
-   Implement real-time search suggestions or autocomplete based on popular queries or restaurant/menu keywords.
-
-8. **Model Switcher for Backend**  
-   Provide an option to dynamically switch between Gemini and local LLaMA models based on user preference or availability.
-
-9. **Feedback Loop and Analytics**  
-   Allow users to rate responses and gather usage analytics to refine prompts, improve model outputs, and optimize FAQ answers.
-
-10. **Mobile Responsiveness**  
-    Enhance the Streamlit app layout for better viewing on smartphones and tablets using custom CSS or responsive layout features.
-
-
-
+// Response
+{ "faithfulness": 0.94, "answer_relevance": 0.89 }
+```
 
 ---
 
+## Challenges & Solutions
+
+| Challenge | Solution |
+|-----------|----------|
+| Zomato dynamic content and lazy-loaded menus | Selenium with retry loops to click all "Read More" buttons before parsing |
+| Single-stage dense retrieval missing exact name matches | Hybrid FAISS + BM25 with RRF — keyword precision and semantic recall combined |
+| Bi-encoder shallow scoring on top candidates | Cross-encoder reranking on shortlist for fine-grained relevance scoring |
+| Gemini API rate limits (5 RPM free tier) | LLM-as-judge evaluation decoupled from chat path; restaurant descriptions cached to disk |
+| Slow cold-start from re-encoding 500+ documents | FAISS index + BM25 + embeddings persisted to disk with MD5 cache invalidation |
+| Vague follow-up queries ("what about non-veg?") | Per-session sliding-window conversation memory injected into every prompt |
+
+---
+
+## Restaurants Covered
+
+KFC · Domino's · Pizza Hut · Foodbay · Waffle by Nature · Patiala Lassi · Desi Tadka · Baap of Rolls · Prakash Hotel
